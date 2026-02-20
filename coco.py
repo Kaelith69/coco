@@ -1,81 +1,114 @@
+import sys
+import os
+import threading
+import queue
 import torch
 import yaml
 import cv2
-import threading
-import os
 from datetime import datetime
 import pathlib
 
-# Patch for Windows to handle PosixPath issue
-temp = pathlib.PosixPath
-pathlib.PosixPath = pathlib.WindowsPath
+# Patch for Windows to handle PosixPath issue (only applied on Windows)
+if sys.platform == "win32":
+    pathlib.PosixPath = pathlib.WindowsPath
 
-def save_image(frame):
-    # Save the frame as an image with a timestamp.
-    save_path = 'CoconutDetection Pictures'
-    if not os.path.exists(save_path):
-        os.makedirs(save_path)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    image_name = f'coconut_detection_{timestamp}.jpg'
-    image_path = os.path.join(save_path, image_name)
-    cv2.imwrite(image_path, frame)
-    print(f"Image saved: {image_path}")
+# ─── Configuration ────────────────────────────────────────────────────────────
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+MODEL_PATH = os.path.join(_BASE_DIR, 'best1.pt')
+YAML_PATH = os.path.join(_BASE_DIR, 'AIYolov5', 'data.yaml')
+SAVE_DIR = os.path.join(_BASE_DIR, 'CoconutDetection Pictures')
+CONFIDENCE_THRESHOLD = 0.67
+WINDOW_NAME = 'Coconut Detection'
+CAMERA_INDEX = 0
+MIN_LABEL_Y = 15       # minimum y-offset so labels are not drawn off the top edge
 
-# Load YOLOv5 model using torch.hub with force_reload=True to refresh cache
-model = torch.hub.load('ultralytics/yolov5', 'custom', 
-                       path=r'C:\Users\sayan\Downloads\coco\AIYolov5\content\yolov5\runs\train\yolov5s_results\weights\best.pt', 
-                       force_reload=True)
+# ─── Image-saving worker ──────────────────────────────────────────────────────
+_save_queue: queue.Queue = queue.Queue(maxsize=50)
 
-# Attempt to load custom class names from a YAML file.
-yaml_path = 'AIYolov5/data.yaml'
-if os.path.exists(yaml_path):
-    with open(yaml_path, 'r') as f:
-        data = yaml.load(f, Loader=yaml.FullLoader)
-    classes = data['names']
-    print(f"Loaded custom class names from {yaml_path}")
+def _save_worker() -> None:
+    """Background thread: drain the save queue and write images to disk."""
+    os.makedirs(SAVE_DIR, exist_ok=True)
+    while True:
+        frame = _save_queue.get()
+        if frame is None:   # sentinel value → exit
+            break
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        path = os.path.join(SAVE_DIR, f'coconut_detection_{timestamp}.jpg')
+        cv2.imwrite(path, frame)
+        print(f"Image saved: {path}")
+        _save_queue.task_done()
+
+_save_thread = threading.Thread(target=_save_worker, daemon=True)
+_save_thread.start()
+
+# ─── Model loading ────────────────────────────────────────────────────────────
+model = torch.hub.load('ultralytics/yolov5', 'custom', path=MODEL_PATH, force_reload=False)
+model.eval()
+
+# ─── Class names ──────────────────────────────────────────────────────────────
+if os.path.exists(YAML_PATH):
+    with open(YAML_PATH, 'r') as f:
+        data = yaml.safe_load(f)
+    classes = data.get('names', [])
+    print(f"Loaded custom class names from {YAML_PATH}: {classes}")
 else:
-    print(f"YAML file not found at {yaml_path}. Using default model class names.")
-    # YOLOv5 typically stores class names in model.names.
+    print(f"YAML file not found at {YAML_PATH}. Using model class names.")
     classes = model.names if hasattr(model, 'names') else []
 
-# Initialize video capture.
-cap = cv2.VideoCapture(0)
-cv2.namedWindow('Coconut Detection', cv2.WINDOW_NORMAL)
-cv2.resizeWindow('Coconut Detection', 800, 600)
+# ─── Video capture ────────────────────────────────────────────────────────────
+cap = cv2.VideoCapture(CAMERA_INDEX)
+if not cap.isOpened():
+    print(f"Error: Cannot open camera (index {CAMERA_INDEX})")
+    _save_queue.put(None)
+    sys.exit(1)
 
-while True:
-    ret, frame = cap.read()
-    if not ret:
-        print("Failed to grab frame")
-        break
+cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
+cv2.resizeWindow(WINDOW_NAME, 800, 600)
 
-    # Run inference on the frame.
-    results = model(frame)
-    # results.xyxy[0] contains a tensor with detections: [x1, y1, x2, y2, confidence, class]
-    detections = results.xyxy[0].cpu().numpy()  # Convert to NumPy array
+# ─── Detection loop ───────────────────────────────────────────────────────────
+try:
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            print("Failed to grab frame")
+            break
 
-    for detection in detections:
-        x1, y1, x2, y2, conf, cls = detection
-        if conf > 0.67:
-            class_idx = int(cls)
-            class_name = classes[class_idx] if class_idx < len(classes) else str(class_idx)
-            cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
-            cv2.putText(frame, f'{class_name} {conf:.2f}', (int(x1), int(y1)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2, cv2.LINE_AA)
-            # Save image asynchronously.
-            threading.Thread(target=save_image, args=(frame.copy(),), daemon=True).start()
+        # Run inference on the frame.
+        results = model(frame)
+        # results.xyxy[0]: [x1, y1, x2, y2, confidence, class]
+        detections = results.xyxy[0].cpu().numpy()
 
-    cv2.imshow('Coconut Detection', frame)
-    key = cv2.waitKey(1)
-    if key in [ord('q'), ord('Q'), 27]:  # Quit on Q, q, or Esc.
-        break
-    elif key in [ord('c'), ord('C')]:      # Close window on C or c.
-        cv2.destroyAllWindows()
-        break
-    elif key in [ord('m'), ord('M')]:      # Maximize window on M or m.
-        cv2.setWindowProperty('Coconut Detection', cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
-    elif key in [ord('n'), ord('N')]:      # Normalize window on N or n.
-        cv2.setWindowProperty('Coconut Detection', cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_NORMAL)
+        detected = False
+        for detection in detections:
+            x1, y1, x2, y2, conf, cls = detection
+            if conf > CONFIDENCE_THRESHOLD:
+                detected = True
+                class_idx = int(cls)
+                class_name = classes[class_idx] if class_idx < len(classes) else str(class_idx)
+                cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
+                label_y = max(int(y1) - 5, MIN_LABEL_Y)
+                cv2.putText(frame, f'{class_name} {conf:.2f}', (int(x1), label_y),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2, cv2.LINE_AA)
 
-cap.release()
-cv2.destroyAllWindows()
+        # Save one image per frame that contains at least one detection.
+        if detected:
+            if not _save_queue.full():
+                _save_queue.put(frame.copy())
+            else:
+                print("Warning: save queue is full; detection frame dropped")
+
+        cv2.imshow(WINDOW_NAME, frame)
+        key = cv2.waitKey(1) & 0xFF
+        if key in (ord('q'), ord('Q'), 27):     # Q / q / Esc → quit
+            break
+        elif key in (ord('c'), ord('C')):        # C / c → close window
+            cv2.destroyAllWindows()
+            break
+        elif key in (ord('m'), ord('M')):        # M / m → maximise
+            cv2.setWindowProperty(WINDOW_NAME, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+        elif key in (ord('n'), ord('N')):        # N / n → normalise
+            cv2.setWindowProperty(WINDOW_NAME, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_NORMAL)
+finally:
+    cap.release()
+    cv2.destroyAllWindows()
+    _save_queue.put(None)   # signal worker thread to exit cleanly
